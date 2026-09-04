@@ -268,7 +268,7 @@ def get_event(event_id: str) -> dict:
 
 @router.get("/groups")
 def list_groups(
-    limit_groups: int = Query(20, ge=1, le=100),
+    limit_groups: int = Query(20, ge=1, le=5000),
     before_day: Optional[str] = Query(None, description="YYYY-MM-DD — page to the D days strictly before this day"),
     days: int = Query(3, ge=1, le=31, description="how many distinct journal days to return per page"),
 ) -> dict:
