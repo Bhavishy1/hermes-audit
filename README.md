@@ -81,16 +81,6 @@ Every event gets a deterministic one-line `human_summary` generated at log time 
 
 - **Desktop Activity page** (Hermes desktop app, route `/activity`): a live, filterable feed. *Grouped* view rolls the last 300 events into per-turn request groups (by `trace_id`) with outcome badges, action counts, total duration, and summed token usage; *Flat* view is a date-grouped list. Type/actor/outcome filters, substring search over tool name/detail/summary, click-to-expand per event (full detail JSON, provenance, token line, causal trace chain), "Load more" paging. Live updates arrive over the `/events/stream` WebSocket with a polling fallback; also reachable via the palette command "Open Activity (Audit Trail)".
 
-![Grouped view of the desktop Activity page with day sections expanded, showing per-turn cards with outcome badges and durations](docs/screenshots/activity-grouped.png)
-
-![An expanded turn-group listing its tool calls, the collapsed LLM summary line, and the token-usage chip](docs/screenshots/turn-group-expanded.png)
-
-![A single event expanded to its key/value grid and full detail JSON](docs/screenshots/event-detail.png)
-
-![The filters bar with the day picker and action-type dropdown open](docs/screenshots/filters-bar.png)
-
-![Flat view: the date-grouped list of individual events](docs/screenshots/activity-flat.png)
-
 - **Web dashboard feed** (dashboard plugin, tab `/activity`): same data through the plugin's REST API, grouped or flat.
 
 ## Reading the journal programmatically
