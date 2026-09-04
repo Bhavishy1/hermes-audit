@@ -8,6 +8,9 @@ Append-only audit trail for [Hermes Agent](https://hermes-agent.nousresearch.com
 - **Tamper-evident integrity** — every row is hash-chained (SHA-256) so edits, deletions, or reordering are detectable; crash recovery marks actions interrupted mid-flight; a failed commit is retained and retried rather than silently dropped.
 - **Blocked-attempt visibility** — tool attempts are journaled *before* execution, so calls the agent tried and was denied are on the trail alongside the ones that ran.
 
+<img width="1070" height="322" alt="Screenshot 2026-09-04 at 5 22 36 PM" src="https://github.com/user-attachments/assets/266f818c-6cb6-4476-aeec-d8c484095b77" />
+
+
 ## What it captures
 
 | What | How | Action type |
