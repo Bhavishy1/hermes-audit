@@ -449,6 +449,11 @@ function ActivityPage({ ctx }) {
   const [expandedDaysInit, setExpandedDaysInit] = useState(false);
   const [live, setLive] = useState(false);
   const [err, setErr] = useState(null);
+  // Loading flags: true after the first load resolves (or fails). While false,
+  // the views render a subtle "Loading activity…" row instead of the
+  // EmptyState, so the initial fetch never flashes "No activity yet".
+  const [groupsLoaded, setGroupsLoaded] = useState(false);
+  const [eventsLoaded, setEventsLoaded] = useState(false);
   const filtersRef = useRef(filters);
   const qRef = useRef(q);
   const nextBeforeRef = useRef(null);
@@ -480,8 +485,9 @@ function ActivityPage({ ctx }) {
         nextBeforeRef.current = res.next_before_id;
         setNextBefore(res.next_before_id);
         setErr(null);
+        setEventsLoaded(true);
       })
-      .catch((e) => setErr("Error loading events: " + String(e)));
+      .catch((e) => { setErr("Error loading events: " + String(e)); setEventsLoaded(true); });
   }, [ctx]);
 
   const loadStats = useCallback(() => {
@@ -530,8 +536,9 @@ function ActivityPage({ ctx }) {
         setHasMoreGroups(!!(res && res.has_more));
         if (res && res.oldest_day) setOldestDay(res.oldest_day);
         setErr(null);
+        setGroupsLoaded(true);
       })
-      .catch(() => setServerGroups(null));
+      .catch(() => { setServerGroups(null); setGroupsLoaded(true); });
   }, [ctx]);
   // Load older days: ask the server for days strictly before oldest_day and
   // APPEND the returned older groups (dedupe by group key). oldest_day /
@@ -585,14 +592,63 @@ function ActivityPage({ ctx }) {
       }
       setEvents((prev) => [ev].concat(prev).slice(0, 400));
       loadStats();
-      loadGroups();
+      // Merge the new event into the grouped view incrementally instead of a
+      // full loadGroups() refetch (which re-queries all 3 days per event).
+      // Only today's window changes live, so: add the event to its trace's
+      // group (creating a new top group for a new trace), and leave older
+      // paged-in days untouched. The periodic poll still does full refetches.
+      setServerGroups((prev) => {
+        if (!prev) return prev;
+        const key = ev.trace_id || "singleton-" + ev.event_id;
+        const idx = prev.findIndex((g) =>
+          (g.trace_id || "singleton-" + ((g.events || [])[0] || {}).event_id) === key);
+        if (idx >= 0) {
+          const g = prev[idx];
+          const events = (g.events || []).concat([ev]);
+          const updated = Object.assign({}, g, {
+            events,
+            eventCount: (g.eventCount || 0) + 1,
+            end_ts: ev.ts_utc || g.end_ts,
+            llm_call_count: (g.llm_call_count || 0) + (ev.action_type === "llm_call" ? 1 : 0),
+            tool_call_count: (g.tool_call_count || 0) + (ev.action_type === "tool_call" || ev.action_type === "skill_write" ? 1 : 0),
+          });
+          const next = prev.slice();
+          next.splice(idx, 1);
+          next.unshift(updated); // most-recent group floats to top
+          return next;
+        }
+        // New trace -> new singleton group at top (matches buildGroups shape).
+        const g = {
+          trace_id: ev.trace_id || null,
+          startTs: ev.ts_utc, endTs: ev.ts_utc,
+          start_ts: ev.ts_utc, end_ts: ev.ts_utc,
+          events: [ev], eventCount: 1,
+          toolCallCount: ev.action_type === "tool_call" || ev.action_type === "skill_write" ? 1 : 0,
+          tool_call_count: ev.action_type === "tool_call" || ev.action_type === "skill_write" ? 1 : 0,
+          llmCallCount: ev.action_type === "llm_call" ? 1 : 0,
+          llm_call_count: ev.action_type === "llm_call" ? 1 : 0,
+          totalDurationMs: ev.duration_ms || 0, total_duration_ms: ev.duration_ms || 0,
+          outcome: ev.outcome || "success",
+          title: ev.human_summary || ev.action_type || "Turn",
+        };
+        return [g].concat(prev);
+      });
     };
     let sock = null;
     try {
       if (ctx.socket) sock = ctx.socket("/events/stream?since=0", onMsg);
     } catch (e) { sock = null; }
     // Polling fallback (also covers ctx.socket being a no-op on OAuth remotes).
-    poll = setInterval(() => { if (!disposed) loadStats(); }, 5000);
+    // Stats refresh on 5s; a full grouped refetch runs on a slower 15s cadence
+    // to reconcile any drift from the incremental per-event merges in onMsg
+    // (which avoid re-querying all 3 days on every single event).
+    let ticks = 0;
+    poll = setInterval(() => {
+      if (disposed) return;
+      loadStats();
+      ticks += 1;
+      if (ticks % 3 === 0) loadGroups();
+    }, 5000);
     return () => {
       disposed = true;
       if (poll) clearInterval(poll);
@@ -706,7 +762,9 @@ function ActivityPage({ ctx }) {
 
     viewMode === "grouped"
       ? jsx(ScrollArea, { className: "space-y-1.5", children:
-          daySections.length === 0
+          !groupsLoaded
+            ? jsx("div", { className: "mt-3 text-[11px] uppercase tracking-wide", style: { color: "var(--ui-text-secondary)" }, children: "Loading activity…" })
+            : daySections.length === 0
             ? jsx(EmptyState, { title: "No activity yet", description: "Events appear here as the agent acts." })
             : [
                 daySections.map((sec) =>
@@ -736,7 +794,9 @@ function ActivityPage({ ctx }) {
               ],
         })
       : jsx(ScrollArea, { className: "space-y-1.5", children:
-          rows.length === 0
+          !eventsLoaded
+            ? jsx("div", { className: "mt-3 text-[11px] uppercase tracking-wide", style: { color: "var(--ui-text-secondary)" }, children: "Loading activity…" })
+            : rows.length === 0
             ? jsx(EmptyState, { title: "No activity yet", description: "Events appear here as the agent acts." })
             : rows.map((r, i) =>
                 r.date
