@@ -147,6 +147,8 @@ After any edit, deletion, reordering, or re-insertion, `valid` is `False`, `firs
 
 hermes-audit is a **standalone plugin** — you drop it into your Hermes plugins directory and enable it. No core changes, no pip install.
 
+> **Fast path:** if you just want to use it (not modify it), `hermes plugins install Bhavishy1/hermes-audit` does the clone + enable in one step. The manual steps below are for hacking on the source.
+
 **Quick start (default profile):**
 
 ```bash
