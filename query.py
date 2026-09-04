@@ -10,8 +10,17 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 from typing import Any, List, Optional
+
+# Day-scoped grouped() window: the default number of distinct journal days
+# returned per page, and the per-day event cap that bounds the query so one
+# very busy day cannot make it unbounded (replaces the old flat
+# 'last 300 events' window that hid entire past days).
+_GROUPED_DEFAULT_DAYS = 3
+_GROUPED_PER_DAY_CAP = 2000
+_DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 _COLUMNS = (
     "event_id, schema_version, ts_utc, seq, session_id, conversation_id, "
@@ -378,26 +387,99 @@ class AuditQuery:
     # grouped (request groups)
     # ------------------------------------------------------------------
 
-    def grouped(self, limit_groups: int = 20) -> List[dict]:
-        """Recent events organized into per-turn request groups.
+    def grouped(
+        self,
+        limit_groups: int = 20,
+        before_day: Optional[str] = None,
+        days: int = _GROUPED_DEFAULT_DAYS,
+    ) -> dict:
+        """Day-scoped recent events organized into per-turn request groups.
 
-        Fetches the most recent events, groups them by trace_id (NULL-trace
-        events each become their own singleton group keyed by event_id), and
-        orders groups newest-first by their latest event's ts_utc. Events
-        within a group are ordered seq ascending.
+        Returns groups for the ``days`` most recent distinct journal days
+        (default 3). When ``before_day`` (YYYY-MM-DD) is given, returns the
+        ``days`` distinct journal days STRICTLY BEFORE that day instead —
+        the paging cursor for older history. Each day contributes at most
+        ``_GROUPED_PER_DAY_CAP`` events (newest first within the day), so a
+        single very busy day cannot make the query unbounded; this replaces
+        the old flat 'last 300 events' window that hid entire past days.
+
+        Events are grouped by trace_id (NULL-trace events each become their
+        own singleton group keyed by event_id) and groups are ordered
+        newest-first by their latest event's ts_utc. Events within a group
+        are ordered seq ascending.
 
         Each group dict: trace_id, start_ts, end_ts, event_count,
         tool_call_count, llm_call_count, total_duration_ms, outcome
         ('error' > 'pending' > 'success' rollup), title (first tool_call's
         human_summary, else first event's human_summary, else 'Turn'),
         and an 'events' list (display_summary derived per _rows_to_dicts).
+
+        The result is a dict (not a bare list) so REST and Python callers
+        agree: {'groups': [...], 'has_more': bool, 'oldest_day': str|None}
+        where ``oldest_day`` is the oldest journal day present in the
+        returned window (the next page's before_day) and ``has_more`` is
+        True when journal days strictly older than it still exist.
+
+        Raises ValueError on a malformed before_day (must be YYYY-MM-DD).
         """
-        events = self.recent(limit=300)
-        if not events:
-            return []
+        if before_day is not None and not _DAY_RE.match(before_day):
+            raise ValueError("before_day must be YYYY-MM-DD")
+        try:
+            days = max(int(days), 1)
+        except (TypeError, ValueError):
+            days = _GROUPED_DEFAULT_DAYS
+
+        all_events: List[dict] = []
+        oldest_day: Optional[str] = None
+        has_more = False
+        if self._db_exists():
+            conn = self._connect()
+            try:
+                # 1. Pick the window: the ``days`` most recent distinct
+                #    journal days, or the ``days`` most recent ones strictly
+                #    BEFORE before_day when paging (bound params only).
+                day_rows = conn.execute(
+                    "SELECT DISTINCT substr(ts_utc, 1, 10) AS day "
+                    "FROM audit_events "
+                    "WHERE ts_utc IS NOT NULL "
+                    "AND (? IS NULL OR substr(ts_utc, 1, 10) < ?) "
+                    "ORDER BY day DESC LIMIT ?",
+                    (before_day, before_day, days),
+                ).fetchall()
+                wanted = [r[0] for r in day_rows]
+                if wanted:
+                    # 2. Pull events per day, capped per day so one busy day
+                    #    bounds cost (newest-first within each day). A plain
+                    #    per-day loop — per-component ORDER BY/LIMIT is not
+                    #    allowed in a SQLite compound SELECT, so no UNION.
+                    for d in wanted:
+                        rows = conn.execute(
+                            "SELECT event_id, schema_version, ts_utc, seq, session_id, "
+                            "conversation_id, trace_id, parent_event_id, actor, "
+                            "action_type, tool_name, side_effect_class, outcome, "
+                            "duration_ms, detail_json, provenance_json, human_summary "
+                            "FROM audit_events "
+                            "WHERE ts_utc >= ? AND ts_utc < ? "
+                            "ORDER BY ts_utc DESC, seq DESC LIMIT ?",
+                            (d + "T00:00:00", d + "T24:00:00", _GROUPED_PER_DAY_CAP),
+                        ).fetchall()
+                        all_events.extend(self._rows_to_dicts(rows))
+                    oldest_day = wanted[-1]
+                    # 3. has_more: do strictly-older journal days exist
+                    #    beyond the oldest day we just returned?
+                    more = conn.execute(
+                        "SELECT 1 FROM audit_events "
+                        "WHERE ts_utc IS NOT NULL AND substr(ts_utc, 1, 10) < ? LIMIT 1",
+                        (oldest_day,),
+                    ).fetchone()
+                    has_more = more is not None
+            except sqlite3.Error:
+                all_events, oldest_day, has_more = [], None, False
+            finally:
+                conn.close()
 
         groups: dict = {}
-        for ev in events:
+        for ev in all_events:
             key = ev.get("trace_id") or "event:" + str(ev.get("event_id"))
             groups.setdefault(key, []).append(ev)
 
@@ -406,7 +488,21 @@ class AuditQuery:
         # Newest group first: by latest event ts_utc desc, then that event's
         # seq desc as a deterministic tie-break.
         built.sort(key=lambda g: (g["end_ts"], g["events"][-1]["seq"]), reverse=True)
-        return built[: max(int(limit_groups), 0)]
+
+        # Day-scoping is the primary window: every group in the selected days
+        # is returned (cost is already bounded by the per-day event cap).
+        # limit_groups is only a safety ceiling so a pathological multi-day
+        # window cannot return an unbounded number of groups; it must NOT cut
+        # off older days' groups while newer days fill the budget, which was
+        # the original "past days hidden" bug in a new form.
+        ceiling = max(int(limit_groups), 0)
+        if ceiling and len(built) > ceiling:
+            built = built[:ceiling]
+        return {
+            "groups": built,
+            "has_more": has_more,
+            "oldest_day": oldest_day,
+        }
 
     @staticmethod
     def _build_group(evs: List[dict]) -> dict:

@@ -269,29 +269,39 @@ def get_event(event_id: str) -> dict:
 @router.get("/groups")
 def list_groups(
     limit_groups: int = Query(20, ge=1, le=100),
+    before_day: Optional[str] = Query(None, description="YYYY-MM-DD — page to the D days strictly before this day"),
+    days: int = Query(3, ge=1, le=31, description="how many distinct journal days to return per page"),
 ) -> dict:
-    """Recent events rolled up into per-turn request groups (newest first).
+    """Day-scoped request groups (newest day first) with paging metadata.
 
-    Same algorithm as AuditQuery.grouped(): last 300 events grouped by
-    trace_id (NULL-trace events each become a singleton group keyed by
-    event_id, exposed as trace_id "event:<event_id>"), groups ordered by
-    their latest event's ts_utc desc, events within a group by seq asc.
+    Same algorithm as AuditQuery.grouped(): returns groups for the most
+    recent ``days`` (default 3) distinct journal days, or — when
+    ``before_day`` (YYYY-MM-DD) is given — the ``days`` distinct days
+    strictly before it. Each day contributes at most ~2000 events (a
+    per-day cap that bounds cost; replaces the old flat LIMIT 300, which
+    made days with >300 events swallow all prior history). Events are
+    grouped by trace_id (NULL-trace events each become a singleton group
+    keyed by event_id, exposed as trace_id "event:<event_id>"), groups
+    ordered by their latest event's ts_utc desc, events within a group by
+    seq asc.
+
+    Returns {'groups': [...], 'count', 'has_more', 'oldest_day'} where
+    ``oldest_day`` (YYYY-MM-DD or None) is the oldest day in the returned
+    window and ``has_more`` is True when strictly older days exist — the
+    frontend pages by passing oldest_day back as before_day.
     """
     db = _db_path()
-    rows = _rows(
-        db,
-        """
-        SELECT event_id, schema_version, ts_utc, seq, session_id, conversation_id,
-               trace_id, parent_event_id, actor, action_type, tool_name,
-               side_effect_class, outcome, duration_ms, detail_json, provenance_json,
-               human_summary
-          FROM audit_events
-         ORDER BY ts_utc DESC, seq DESC
-         LIMIT 300
-        """,
-    )
-    groups = _group_events(rows)
-    return {"groups": groups[:limit_groups], "count": min(len(groups), limit_groups)}
+    try:
+        result = AuditQuery(db).grouped(limit_groups=limit_groups, before_day=before_day, days=days)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    groups = result["groups"]
+    return {
+        "groups": groups,
+        "count": len(groups),
+        "has_more": result["has_more"],
+        "oldest_day": result["oldest_day"],
+    }
 
 
 @router.get("/groups/{trace_id}")

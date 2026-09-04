@@ -217,19 +217,24 @@ class TestGrouped(unittest.TestCase):
     def tearDown(self):
         self.j.close(); self.tmp.cleanup()
 
+    def _groups(self, **kw):
+        """grouped() returns {'groups': [...], 'has_more', 'oldest_day'};
+        these tests assert on the group list itself."""
+        return self.q.grouped(**kw)["groups"]
+
     def test_group_count_and_ordering(self):
-        groups = self.q.grouped()
+        groups = self._groups()
         self.assertEqual(len(groups), 3)
         # Newest group first by latest event ts_utc.
         self.assertEqual([g["trace_id"] for g in groups],
                          ["trace-2", "event:" + self.null_event_id, "trace-1"])
 
     def test_limit_groups(self):
-        self.assertEqual(len(self.q.grouped(limit_groups=2)), 2)
-        self.assertEqual(self.q.grouped(limit_groups=2)[0]["trace_id"], "trace-2")
+        self.assertEqual(len(self._groups(limit_groups=2)), 2)
+        self.assertEqual(self._groups(limit_groups=2)[0]["trace_id"], "trace-2")
 
     def test_multi_event_group_counts_and_rollup(self):
-        groups = {g["trace_id"]: g for g in self.q.grouped()}
+        groups = {g["trace_id"]: g for g in self._groups()}
         g1 = groups["trace-1"]
         self.assertEqual(g1["event_count"], 2)
         self.assertEqual(g1["tool_call_count"], 1)
@@ -251,7 +256,7 @@ class TestGrouped(unittest.TestCase):
         self.assertEqual(g2["title"], "Searched the web")
 
     def test_singleton_null_trace_group(self):
-        groups = {g["trace_id"]: g for g in self.q.grouped()}
+        groups = {g["trace_id"]: g for g in self._groups()}
         g = groups["event:" + self.null_event_id]
         self.assertEqual(g["event_count"], 1)
         self.assertEqual(g["tool_call_count"], 0)
@@ -266,14 +271,131 @@ class TestGrouped(unittest.TestCase):
                           context={"trace_id": "trace-1", "session_id": "s1"})
         self.j.complete(a3, SUCCESS, duration_ms=5)
         self.j.flush()
-        groups = {g["trace_id"]: g for g in self.q.grouped()}
+        groups = {g["trace_id"]: g for g in self._groups()}
         seqs = [e["seq"] for e in groups["trace-1"]["events"]]
         self.assertEqual(seqs, sorted(seqs))
         self.assertEqual(len(seqs), 3)
 
     def test_empty_db_returns_empty_list(self):
         empty = AuditQuery(os.path.join(self.tmp.name, "missing.db"))
-        self.assertEqual(empty.grouped(), [])
+        self.assertEqual(empty.grouped()["groups"], [])
+
+
+class TestGroupedDayPaging(unittest.TestCase):
+    """Day-scoped grouped() paging: before_day cursor, has_more, oldest_day.
+
+    Regression: the old grouped() read a flat 'last 300 events' window, so a
+    single day with >300 events swallowed all prior history and past days
+    never reached the Grouped view.
+    """
+
+    BUSY_DAY = "2026-09-04"   # newest day, >300 events (old LIMIT 300 window)
+    MID_DAY = "2026-09-03"
+    OLD_DAY = "2026-09-02"    # falls entirely outside the old 300-event window
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = os.path.join(self.tmp.name, "audit.db")
+        self.j = AuditJournal(self.db)
+
+        # Busy newest day: 350 events on one trace (way past the old 300 cap).
+        self.busy_event_ids = []
+        for i in range(350):
+            e = self.j.begin("assistant", TOOL_CALL, tool_name="terminal",
+                             context={"trace_id": "trace-busy", "session_id": "s-busy"})
+            self.j.complete(e, SUCCESS)
+            self.busy_event_ids.append(e.event_id)
+
+        # Mid day: one normal turn.
+        m1 = self.j.begin("assistant", TOOL_CALL, tool_name="read_file",
+                          context={"trace_id": "trace-mid", "session_id": "s-mid"})
+        self.j.complete(m1, SUCCESS)
+
+        # Old day: one normal turn — the day the old window hid entirely.
+        o1 = self.j.begin("assistant", TOOL_CALL, tool_name="web_search",
+                          context={"trace_id": "trace-old", "session_id": "s-old"})
+        self.j.complete(o1, SUCCESS)
+
+        self.j.flush()
+        # Backdate by trace: busy -> Sep 4 (10:00), mid -> Sep 3, old -> Sep 2.
+        # Direct writable connection, same pattern as TestGrouped.setUp.
+        conn = sqlite3.connect(self.db, timeout=10.0)
+        conn.execute("UPDATE audit_events SET ts_utc = '2026-09-04T10:00:00Z' WHERE trace_id = 'trace-busy'")
+        conn.execute("UPDATE audit_events SET ts_utc = '2026-09-03T10:00:00Z' WHERE trace_id = 'trace-mid'")
+        conn.execute("UPDATE audit_events SET ts_utc = '2026-09-02T10:00:00Z' WHERE trace_id = 'trace-old'")
+        conn.commit()
+        conn.close()
+        self.q = AuditQuery(self.db)
+
+    def tearDown(self):
+        self.j.close(); self.tmp.cleanup()
+
+    def test_default_returns_recent_days_including_old_beyond_300_window(self):
+        """(a) Default window spans recent days, including one the old
+        flat LIMIT 300 would have cut off entirely."""
+        res = self.q.grouped(days=3)
+        self.assertIsInstance(res, dict)
+        days = {g["start_ts"][:10] for g in res["groups"]}
+        self.assertIn(self.BUSY_DAY, days)
+        self.assertIn(self.MID_DAY, days)
+        self.assertIn(self.OLD_DAY, days)  # outside the old 300-event window
+        self.assertEqual(self.OLD_DAY, res["oldest_day"])
+        # A group can exceed the old 300-event cap intact.
+        busy = next(g for g in res["groups"] if g["trace_id"] == "trace-busy")
+        self.assertEqual(busy["event_count"], 350)
+        # Events within the group stay seq-ascending.
+        seqs = [e["seq"] for e in busy["events"]]
+        self.assertEqual(seqs, sorted(seqs))
+        # No paging cursor on the newest page: oldest_day is not a valid
+        # before_day for ANOTHER page older than it (Sep 2 is the oldest day).
+
+    def test_before_day_pages_to_strictly_older_days(self):
+        """(b) before_day=<oldest returned day> returns the next-older days."""
+        first = self.q.grouped(days=3)
+        self.assertEqual(first["oldest_day"], self.OLD_DAY)
+        self.assertTrue(first["has_more"] is False)  # Sep 2 is the first day
+
+        # Page before the mid day: only the old day remains.
+        page2 = self.q.grouped(days=3, before_day=self.MID_DAY)
+        days2 = {g["start_ts"][:10] for g in page2["groups"]}
+        self.assertEqual(days2, {self.OLD_DAY})
+        self.assertEqual(page2["oldest_day"], self.OLD_DAY)
+        self.assertFalse(page2["has_more"])
+        # Strictly older: the busy day must NOT leak into this page.
+        self.assertNotIn(self.BUSY_DAY, days2)
+
+        # before_day at the very start of history -> empty page, no more.
+        empty = self.q.grouped(days=3, before_day=self.OLD_DAY)
+        self.assertEqual(empty["groups"], [])
+        self.assertIsNone(empty["oldest_day"])
+        self.assertFalse(empty["has_more"])
+
+    def test_has_more_true_when_older_events_exist(self):
+        """(c) has_more=True while older days exist, False at start of history."""
+        # Restrict the window to only the newest day: two older days remain.
+        res = self.q.grouped(days=1)
+        self.assertEqual(res["oldest_day"], self.BUSY_DAY)
+        self.assertTrue(res["has_more"])
+        days = {g["start_ts"][:10] for g in res["groups"]}
+        self.assertEqual(days, {self.BUSY_DAY})
+
+        # Page before the busy day: mid day returned, old day still ahead.
+        res2 = self.q.grouped(days=1, before_day=self.BUSY_DAY)
+        self.assertEqual(res2["oldest_day"], self.MID_DAY)
+        self.assertTrue(res2["has_more"])
+
+        # Page before the mid day: old day returned, nothing older.
+        res3 = self.q.grouped(days=1, before_day=self.MID_DAY)
+        self.assertEqual(res3["oldest_day"], self.OLD_DAY)
+        self.assertFalse(res3["has_more"])
+
+    def test_limit_groups_still_applies_within_window(self):
+        res = self.q.grouped(days=3, limit_groups=2)
+        self.assertEqual(len(res["groups"]), 2)
+
+    def test_invalid_before_day_raises(self):
+        with self.assertRaises(ValueError):
+            self.q.grouped(before_day="not-a-day")
 
 
 class TestRetention(unittest.TestCase):

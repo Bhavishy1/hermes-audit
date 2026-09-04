@@ -495,11 +495,65 @@ function ActivityPage({ ctx }) {
   }, [ctx]);
   // Server-side grouping (preferred); fall back to client-side buildGroups on
   // the flat /events list if the endpoint isn't available.
+  // Day-scoped paging: fetch the recent D days (server default), and page
+  // back through history by passing the oldest returned day as before_day.
+  const [hasMoreGroups, setHasMoreGroups] = useState(false);
+  const [oldestDay, setOldestDay] = useState(null);
+  const [loadingOlderDays, setLoadingOlderDays] = useState(false);
   const loadGroups = useCallback(() => {
-    ctx.rest("/groups?limit_groups=30")
-      .then((res) => setServerGroups(res && res.groups ? res.groups : null))
+    // Generous limit_groups: the day window (days=3) + per-day event cap bound
+    // the result, so a small ceiling here would truncate older days' groups
+    // (the "past days hidden" bug). Pass a high ceiling and let day-scoping govern.
+    ctx.rest("/groups?days=3&limit_groups=2000")
+      .then((res) => {
+        // Live updates must not wipe days the user paged in: merge — fresh
+        // groups (the current/recent window) replace entries with the same
+        // group key, older appended pages are kept below.
+        setServerGroups((prev) => {
+          const fresh = res && res.groups ? res.groups : [];
+          if (!prev || prev.length === 0) return fresh.length > 0 ? fresh : null;
+          const byKey = new Map(fresh.map((g) => [g.trace_id || "singleton-" + ((g.events || [])[0] || {}).event_id, g]));
+          const merged = fresh.slice();
+          prev.forEach((g) => {
+            const k = g.trace_id || "singleton-" + ((g.events || [])[0] || {}).event_id;
+            if (!byKey.has(k)) merged.push(g);
+          });
+          return merged;
+        });
+        setHasMoreGroups(!!(res && res.has_more));
+        if (res && res.oldest_day) setOldestDay(res.oldest_day);
+        setErr(null);
+      })
       .catch(() => setServerGroups(null));
   }, [ctx]);
+  // Load older days: ask the server for days strictly before oldest_day and
+  // APPEND the returned older groups (dedupe by group key). oldest_day /
+  // has_more_groups come from the page response so the button pages on.
+  const loadOlderDays = useCallback(() => {
+    if (!oldestDay || loadingOlderDays) return;
+    setLoadingOlderDays(true);
+    ctx.rest("/groups?days=3&limit_groups=2000&before_day=" + encodeURIComponent(oldestDay))
+      .then((res) => {
+        const older = res && res.groups ? res.groups : [];
+        if (older.length > 0) {
+          setServerGroups((prev) => {
+            const seen = new Set((prev || []).map((g) =>
+              g.trace_id || "singleton-" + ((g.events || [])[0] || {}).event_id));
+            const add = older.filter((g) => {
+              const k = g.trace_id || "singleton-" + ((g.events || [])[0] || {}).event_id;
+              return !seen.has(k);
+            });
+            return (prev || []).concat(add);
+          });
+        }
+        // Track the true oldest day across pages so repeated clicks keep
+        // paging deeper instead of re-fetching the same window.
+        setOldestDay((prev) => (res && res.oldest_day) || prev);
+        setHasMoreGroups(!!(res && res.has_more));
+      })
+      .catch((e) => setErr("Error loading older days: " + String(e)))
+      .finally(() => setLoadingOlderDays(false));
+  }, [ctx, oldestDay, loadingOlderDays]);
 
   useEffect(() => { load(false); }, [filters]);
   useEffect(() => { loadFilterOpts(); loadStats(); loadGroups(); loadFacets(); }, []);
@@ -647,18 +701,32 @@ function ActivityPage({ ctx }) {
       ? jsx(ScrollArea, { className: "space-y-1.5", children:
           daySections.length === 0
             ? jsx(EmptyState, { title: "No activity yet", description: "Events appear here as the agent acts." })
-            : daySections.map((sec) =>
-                jsx(DaySection, {
-                  ctx, sec,
-                  expanded: !!expandedDays[sec.day],
-                  onToggle: () => onToggleDay(sec.day),
-                  expandedGroups,
-                  onToggleGroup: onToggleGroup,
-                  expandedEvents: expanded,
-                  onToggleEvent: onToggle,
-                  key: "day-" + sec.day,
-                })
-              ),
+            : [
+                daySections.map((sec) =>
+                  jsx(DaySection, {
+                    ctx, sec,
+                    expanded: !!expandedDays[sec.day],
+                    onToggle: () => onToggleDay(sec.day),
+                    expandedGroups,
+                    onToggleGroup: onToggleGroup,
+                    expandedEvents: expanded,
+                    onToggleEvent: onToggle,
+                    key: "day-" + sec.day,
+                  })
+                ),
+                // Page back through history: requests days strictly before
+                // the oldest day currently shown; server appends nothing —
+                // we merge the returned older groups in loadOlderDays.
+                hasMoreGroups && jsx("div", {
+                  className: "mt-3 text-center",
+                  children: jsx(Button, {
+                    variant: "outline",
+                    onClick: loadOlderDays,
+                    children: loadingOlderDays ? "Loading…" : "Load older days",
+                  }),
+                  key: "more-days",
+                }),
+              ],
         })
       : jsx(ScrollArea, { className: "space-y-1.5", children:
           rows.length === 0
