@@ -1,0 +1,5 @@
+name: hermes-audit
+version: 0.3.0
+description: "Append-only audit journal: logs every agent action (tools, LLM calls, skills, automations) to a local queryable SQLite DB."
+author: Bhavishy Venigandla
+kind: backend

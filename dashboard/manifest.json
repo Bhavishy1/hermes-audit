@@ -1,0 +1,14 @@
+{
+  "name": "hermes-audit",
+  "label": "Activity",
+  "description": "Audit trail visualizer — a live, plain-language feed of every action the agent has taken, with filtering and per-event detail.",
+  "icon": "Activity",
+  "version": "0.1.0",
+  "tab": {
+    "path": "/activity",
+    "position": "after:kanban"
+  },
+  "entry": "dist/index.js",
+  "css": "dist/style.css",
+  "api": "plugin_api.py"
+}

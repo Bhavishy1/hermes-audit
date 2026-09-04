@@ -1,0 +1,21 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# Runtime state
+audit.db
+audit.db-wal
+audit.db-shm
+
+# Screenshot PNGs stay local (privacy); README references placeholders
+docs/screenshots/
+
+# Internal planning/design docs (not for public repo)
+NEXT-PRIORITIES.md
+DECLARED-EFFECTS.md
+AUDIT.md
