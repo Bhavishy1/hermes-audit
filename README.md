@@ -2,48 +2,6 @@
 
 Append-only audit trail for [Hermes Agent](https://hermes-agent.nousresearch.com/docs). Every action the agent takes — tool calls, LLM calls with token usage, skill writes, automations, subagents, approvals, messages, and blocked tool attempts — is journaled to a local, tamper-evident, queryable SQLite database.
 
-## Install
-
-hermes-audit is a **standalone plugin** — you drop it into your Hermes plugins directory and enable it. No core changes, no pip install.
-
-> **Fast path:** if you just want to use it (not modify it), `hermes plugins install Bhavishy1/hermes-audit` does the clone + enable in one step. The manual steps below are for hacking on the source.
-
-**Quick start (default profile):**
-
-```bash
-# 1. Clone into the Hermes plugins directory
-git clone https://github.com/Bhavishy1/hermes-audit ~/.hermes/plugins/hermes-audit
-
-# 2. Enable it (adds hermes-audit to plugins.enabled in config.yaml)
-hermes config set plugins.enabled "$(hermes config get plugins.enabled),hermes-audit"
-
-# 3. Restart the backend (desktop app or `hermes` gateway) — the middleware
-#    registers when a session starts
-```
-
-The journal is created at `$HERMES_HOME/audit.db` (falls back to `~/.hermes/audit.db`) on the first agent action after restart. Open the **Activity** page in the desktop app (⌘K → "Reload desktop plugins" if it doesn't appear) or the web dashboard's `/activity` tab to watch the feed live.
-
-**Using a named profile** (e.g. `hermes -p myprofile`): the *middleware* (the journal writer) is discovered from the profile's own plugins dir, while the *desktop/web UI* is discovered from the root `~/.hermes/plugins/`. So link it into both:
-
-```bash
-# The clone from step 1 already covers the root plugins dir (drives the UI).
-# Also link it into your profile's plugins dir (drives the middleware/journal):
-mkdir -p ~/.hermes/profiles/myprofile/plugins
-ln -s ~/.hermes/plugins/hermes-audit ~/.hermes/profiles/myprofile/plugins/hermes-audit
-```
-
-Then enable and restart as above. (If you only ever use the default profile, the quick-start clone is all you need.)
-
-**What gets loaded:**
-
-1. **Agent plugin (the journal):** `plugin.yaml` + `__init__.py` at the repo root. Hermes calls `register(ctx)`, which wires the middleware envelopes (tool + LLM execution) and lifecycle hooks.
-2. **Desktop Activity page:** `desktop-plugin/plugin.js` (id `hermes-audit`).
-3. **Web dashboard feed:** `dashboard/` (`manifest.json` + `plugin_api.py`, tab `/activity`).
-
-**Schema migrations** are automatic and idempotent — existing `audit.db` files from older versions are upgraded in place on open.
-
-**Requirements:** a running Hermes Agent (no extra Python dependencies — the journal uses only the standard library).
-
 **What you get:**
 
 - **Live Activity feed** — a real-time, filterable feed of everything the agent does, in the Hermes desktop app (`/activity`) and the web dashboard, with per-turn grouping and click-to-expand detail. The read API covers scripts and programmatic audits.
@@ -177,6 +135,49 @@ On an intact trail:
 ```
 
 After any edit, deletion, reordering, or re-insertion, `valid` is `False`, `first_break_seq` points at the first broken row, and `reason` says whether the row's *content* was modified after INSERT (`event_hash` mismatch) or the *chain link* is broken (`prev_hash` does not match the previous row's `event_hash`). Verification runs on its own read-only connection and never touches the writer.
+
+
+## Install
+
+hermes-audit is a **standalone plugin** — you drop it into your Hermes plugins directory and enable it. No core changes, no pip install.
+
+> **Fast path:** if you just want to use it (not modify it), `hermes plugins install Bhavishy1/hermes-audit` does the clone + enable in one step. The manual steps below are for hacking on the source.
+
+**Quick start (default profile):**
+
+```bash
+# 1. Clone into the Hermes plugins directory
+git clone https://github.com/Bhavishy1/hermes-audit ~/.hermes/plugins/hermes-audit
+
+# 2. Enable it (adds hermes-audit to plugins.enabled in config.yaml)
+hermes config set plugins.enabled "$(hermes config get plugins.enabled),hermes-audit"
+
+# 3. Restart the backend (desktop app or `hermes` gateway) — the middleware
+#    registers when a session starts
+```
+
+The journal is created at `$HERMES_HOME/audit.db` (falls back to `~/.hermes/audit.db`) on the first agent action after restart. Open the **Activity** page in the desktop app (⌘K → "Reload desktop plugins" if it doesn't appear) or the web dashboard's `/activity` tab to watch the feed live.
+
+**Using a named profile** (e.g. `hermes -p myprofile`): the *middleware* (the journal writer) is discovered from the profile's own plugins dir, while the *desktop/web UI* is discovered from the root `~/.hermes/plugins/`. So link it into both:
+
+```bash
+# The clone from step 1 already covers the root plugins dir (drives the UI).
+# Also link it into your profile's plugins dir (drives the middleware/journal):
+mkdir -p ~/.hermes/profiles/myprofile/plugins
+ln -s ~/.hermes/plugins/hermes-audit ~/.hermes/profiles/myprofile/plugins/hermes-audit
+```
+
+Then enable and restart as above. (If you only ever use the default profile, the quick-start clone is all you need.)
+
+**What gets loaded:**
+
+1. **Agent plugin (the journal):** `plugin.yaml` + `__init__.py` at the repo root. Hermes calls `register(ctx)`, which wires the middleware envelopes (tool + LLM execution) and lifecycle hooks.
+2. **Desktop Activity page:** `desktop-plugin/plugin.js` (id `hermes-audit`).
+3. **Web dashboard feed:** `dashboard/` (`manifest.json` + `plugin_api.py`, tab `/activity`).
+
+**Schema migrations** are automatic and idempotent — existing `audit.db` files from older versions are upgraded in place on open.
+
+**Requirements:** a running Hermes Agent (no extra Python dependencies — the journal uses only the standard library).
 
 ## Tests
 
