@@ -451,6 +451,7 @@ function ActivityPage({ ctx }) {
   const [err, setErr] = useState(null);
   const filtersRef = useRef(filters);
   const qRef = useRef(q);
+  const nextBeforeRef = useRef(null);
   filtersRef.current = filters;
   qRef.current = q;
 
@@ -466,16 +467,22 @@ function ActivityPage({ ctx }) {
     if (f.day) p.set("day", f.day);
     if (f.model) p.set("model", f.model);
     if (qRef.current) p.set("q", qRef.current);
-    if (append && nextBefore) p.set("before_id", nextBefore);
+    // Read the paging cursor from a ref, not closed-over state: the "Load
+    // more" button's onClick closes over whatever `load` existed at its
+    // render, so a state-read nextBefore here can be stale/null, which made
+    // `append && nextBefore` false -> no before_id sent -> page 1 re-fetched
+    // (the "Load more is broken" bug). A ref always reads the latest cursor.
+    if (append && nextBeforeRef.current) p.set("before_id", nextBeforeRef.current);
     return ctx.rest("/events?" + p.toString())
       .then((res) => {
         setEvents((prev) => (append ? prev.concat(res.events) : res.events));
         setHasMore(res.has_more);
+        nextBeforeRef.current = res.next_before_id;
         setNextBefore(res.next_before_id);
         setErr(null);
       })
       .catch((e) => setErr("Error loading events: " + String(e)));
-  }, [ctx, nextBefore]);
+  }, [ctx]);
 
   const loadStats = useCallback(() => {
     ctx.rest("/stats").then(setStats).catch(() => {});
